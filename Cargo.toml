@@ -1,0 +1,20 @@
+[package]
+name = "fff-cli"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal terminal frontend for the fff-search library"
+license = "MIT"
+
+[[bin]]
+name = "fff"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+dirs = "5.0"
+fff-search = "=0.9.6"
+ratatui = "0.29"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "regex-onig"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
