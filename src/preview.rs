@@ -3,25 +3,60 @@ use std::io::Read;
 use std::path::Path;
 
 use ratatui::text::{Line, Span};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet};
 
+use crate::just_syntax::JUST_SYNTAX_YAML;
 use crate::kdl_syntax::KDL_SYNTAX_YAML;
 use crate::theme;
 
 const MAX_BYTES: u64 = 128 * 1024;
 const MAX_LINES: usize = 250;
 
+/// Extensions that don't have (and aren't worth writing) a dedicated grammar,
+/// but are a specific other language's syntax in disguise: `.sbatch` files
+/// are SLURM batch scripts, i.e. bash with `#SBATCH` pragma comments.
+const EXTENSION_ALIASES: &[(&str, &str)] = &[("sbatch", "sh")];
+
 /// The base syntax set extended with languages `two-face` doesn't bundle
-/// (currently just KDL). Falls back to the unmodified set if the hand-written
-/// KDL definition somehow fails to parse, rather than losing every other
-/// language over one bad grammar.
+/// (currently KDL and justfiles). Falls back to the unmodified set if a
+/// hand-written definition somehow fails to parse, rather than losing every
+/// other language over one bad grammar.
+///
+/// Uses the `no_newlines` variant because `load_base` feeds `parse_line`
+/// each line with its terminator already stripped (via `str::lines`). Some
+/// grammars (e.g. bash's shebang/comment handling) rely on matching the
+/// literal `\n` to pop out of a line-scoped context; paired with the
+/// `newlines` variant, that pop never fires and the context leaks into every
+/// subsequent line, silently swallowing the rest of the file as one comment.
 pub fn build_syntax_set() -> SyntaxSet {
-    let mut builder = two_face::syntax::extra_newlines().into_builder();
-    match SyntaxDefinition::load_from_str(KDL_SYNTAX_YAML, true, None) {
-        Ok(kdl) => builder.add(kdl),
-        Err(error) => eprintln!("warning: could not load built-in KDL syntax: {error}"),
+    let mut builder = two_face::syntax::extra_no_newlines().into_builder();
+    for (name, yaml) in [("KDL", KDL_SYNTAX_YAML), ("Just", JUST_SYNTAX_YAML)] {
+        match SyntaxDefinition::load_from_str(yaml, false, None) {
+            Ok(syntax) => builder.add(syntax),
+            Err(error) => eprintln!("warning: could not load built-in {name} syntax: {error}"),
+        }
     }
     builder.build()
+}
+
+/// Resolves the syntax for a file, trying (in order): the full file name
+/// (so extensionless files like `justfile` or `Makefile` match by name),
+/// the extension, an extension alias (e.g. `.sbatch` -> `.sh`), and finally
+/// plain text.
+fn resolve_syntax<'a>(syntax_set: &'a SyntaxSet, path: &Path) -> &'a SyntaxReference {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    syntax_set
+        .find_syntax_by_extension(file_name)
+        .or_else(|| syntax_set.find_syntax_by_extension(ext))
+        .or_else(|| {
+            EXTENSION_ALIASES
+                .iter()
+                .find(|(from, _)| from.eq_ignore_ascii_case(ext))
+                .and_then(|(_, to)| syntax_set.find_syntax_by_extension(to))
+        })
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text())
 }
 
 #[derive(Clone, Debug)]
@@ -98,10 +133,7 @@ pub fn load_base(syntax_set: &SyntaxSet, path: &Path) -> PreviewResult {
     let content = String::from_utf8_lossy(&bytes);
     let raw_lines: Vec<&str> = content.lines().take(MAX_LINES).collect();
 
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let syntax = syntax_set
-        .find_syntax_by_extension(ext)
-        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let syntax = resolve_syntax(syntax_set, path);
 
     let mut parse_state = ParseState::new(syntax);
     let mut scope_stack = ScopeStack::new();
@@ -240,7 +272,7 @@ mod tests {
             std::process::id()
         ));
         fs::write(&path, "alpha\nbeta\n").unwrap();
-        let syntax_set = two_face::syntax::extra_newlines();
+        let syntax_set = two_face::syntax::extra_no_newlines();
         let preview = load_base(&syntax_set, &path);
         let _ = fs::remove_file(path);
 
@@ -337,8 +369,85 @@ mod tests {
     }
 
     #[test]
+    fn just_syntax_is_registered() {
+        let syntax_set = build_syntax_set();
+        let syntax = syntax_set
+            .find_syntax_by_extension("justfile")
+            .expect("Just syntax should be available");
+        assert_eq!(syntax.name, "Just");
+    }
+
+    #[test]
+    fn justfile_resolves_by_filename_without_extension() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("fff-cli-preview-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("justfile");
+        fs::write(
+            &path,
+            concat!(
+                "# say hello\n",
+                "default: build\n",
+                "\n",
+                "build target=\"release\":\n",
+                "    echo \"building {{target}}\"\n",
+            ),
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(preview.lines.len(), 5);
+        let total_spans: usize = preview.lines.iter().map(|line| line.spans.len()).sum();
+        assert!(
+            total_spans > preview.lines.len() * 2,
+            "expected the justfile to be tokenized, not treated as plain text, got {total_spans} spans across {} lines",
+            preview.lines.len()
+        );
+    }
+
+    #[test]
+    fn sbatch_extension_is_highlighted_as_bash() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}.sbatch",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "#!/bin/bash\n#SBATCH --job-name=test\necho \"hello\"\n",
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 3);
+        // A plain-text fallback would render each line as a single span
+        // after the line-number span; bash tokenization splits it further
+        // (e.g. the shebang, the string in the echo command).
+        assert!(
+            preview.lines[2].spans.len() > 2,
+            "expected the echo line to be tokenized as bash, got {:?}",
+            preview.lines[2]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn extended_syntaxes_available() {
-        let syntax_set = two_face::syntax::extra_newlines();
+        let syntax_set = two_face::syntax::extra_no_newlines();
         
         // Debug: print all syntaxes to see what's available
         eprintln!("\nTotal syntaxes: {}", syntax_set.syntaxes().len());
