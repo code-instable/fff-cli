@@ -7,6 +7,7 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference
 
 use crate::just_syntax::JUST_SYNTAX_YAML;
 use crate::kdl_syntax::KDL_SYNTAX_YAML;
+use crate::mojo_syntax::MOJO_SYNTAX_YAML;
 use crate::theme;
 
 const MAX_BYTES: u64 = 128 * 1024;
@@ -18,9 +19,9 @@ const MAX_LINES: usize = 250;
 const EXTENSION_ALIASES: &[(&str, &str)] = &[("sbatch", "sh")];
 
 /// The base syntax set extended with languages `two-face` doesn't bundle
-/// (currently KDL and justfiles). Falls back to the unmodified set if a
-/// hand-written definition somehow fails to parse, rather than losing every
-/// other language over one bad grammar.
+/// (currently KDL, justfiles, and Mojo). Falls back to the unmodified set if
+/// a hand-written definition somehow fails to parse, rather than losing
+/// every other language over one bad grammar.
 ///
 /// Uses the `no_newlines` variant because `load_base` feeds `parse_line`
 /// each line with its terminator already stripped (via `str::lines`). Some
@@ -30,7 +31,12 @@ const EXTENSION_ALIASES: &[(&str, &str)] = &[("sbatch", "sh")];
 /// subsequent line, silently swallowing the rest of the file as one comment.
 pub fn build_syntax_set() -> SyntaxSet {
     let mut builder = two_face::syntax::extra_no_newlines().into_builder();
-    for (name, yaml) in [("KDL", KDL_SYNTAX_YAML), ("Just", JUST_SYNTAX_YAML)] {
+    let languages = [
+        ("KDL", KDL_SYNTAX_YAML),
+        ("Just", JUST_SYNTAX_YAML),
+        ("Mojo", MOJO_SYNTAX_YAML),
+    ];
+    for (name, yaml) in languages {
         match SyntaxDefinition::load_from_str(yaml, false, None) {
             Ok(syntax) => builder.add(syntax),
             Err(error) => eprintln!("warning: could not load built-in {name} syntax: {error}"),
@@ -442,6 +448,48 @@ mod tests {
                 .iter()
                 .map(|s| s.content.as_ref())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mojo_syntax_is_registered() {
+        let syntax_set = build_syntax_set();
+        let syntax = syntax_set
+            .find_syntax_by_extension("mojo")
+            .expect("Mojo syntax should be available");
+        assert_eq!(syntax.name, "Mojo");
+    }
+
+    #[test]
+    fn mojo_file_is_tokenized_not_treated_as_plain_text() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}.mojo",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "# greet someone\n",
+                "fn greet(name: String) raises -> String:\n",
+                "    var count: Int = 0\n",
+                "    return f\"hello {name}, count={count}\"\n",
+            ),
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 4);
+        let total_spans: usize = preview.lines.iter().map(|line| line.spans.len()).sum();
+        assert!(
+            total_spans > preview.lines.len() * 2,
+            "expected the Mojo file to be tokenized, not treated as plain text, got {total_spans} spans across {} lines",
+            preview.lines.len()
         );
     }
 
