@@ -141,12 +141,39 @@ pub fn load_base(syntax_set: &SyntaxSet, path: &Path) -> PreviewResult {
     PreviewResult { lines: result }
 }
 
-pub fn apply_match_highlight(lines: &mut [Line<'static>], target: &PreviewMatch) {
+/// A match whose characters form a single contiguous span reads as a real
+/// literal substring hit; one broken into several ranges was pieced together
+/// by the fuzzy matcher from scattered characters. The two are highlighted
+/// differently so a glance at the preview shows which matches are "real".
+fn is_exact_match(target: &PreviewMatch) -> bool {
+    target.match_byte_offsets.len() == 1
+}
+
+/// Highlights every match in `matches` within the preview. `current_line`,
+/// when set, marks the match the user has focused (e.g. via up/down through
+/// an expanded file's matches) so it can be called out from the rest.
+pub fn apply_match_highlight(
+    lines: &mut [Line<'static>],
+    matches: &[PreviewMatch],
+    current_line: Option<u64>,
+) {
+    for target in matches {
+        let is_current = current_line == Some(target.line_number);
+        apply_single_match_highlight(lines, target, is_current);
+    }
+}
+
+fn apply_single_match_highlight(
+    lines: &mut [Line<'static>],
+    target: &PreviewMatch,
+    is_current: bool,
+) {
     let target_idx = (target.line_number as usize).saturating_sub(1);
     if target_idx >= lines.len() {
         return;
     }
 
+    let exact = is_exact_match(target);
     let line = &mut lines[target_idx];
 
     if let Some(span) = line.spans.first_mut() {
@@ -158,8 +185,15 @@ pub fn apply_match_highlight(lines: &mut [Line<'static>], target: &PreviewMatch)
         let span_end = pos + span.content.len();
 
         let mut style = span.style.bg(theme::MATCH_LINE_BG);
-        if span_overlaps_match(pos, span_end, Some(target)) {
-            style = theme::match_span_style(style);
+        if span_overlaps_match(pos, span_end, target) {
+            style = if exact {
+                theme::exact_match_span_style(style)
+            } else {
+                theme::match_span_style(style)
+            };
+            if is_current {
+                style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
+            }
         }
         span.style = style;
 
@@ -167,11 +201,9 @@ pub fn apply_match_highlight(lines: &mut [Line<'static>], target: &PreviewMatch)
     }
 }
 
-fn span_overlaps_match(span_start: usize, span_end: usize, target: Option<&PreviewMatch>) -> bool {
-    let Some(t) = target else {
-        return false;
-    };
-    t.match_byte_offsets
+fn span_overlaps_match(span_start: usize, span_end: usize, target: &PreviewMatch) -> bool {
+    target
+        .match_byte_offsets
         .iter()
         .any(|(match_start, match_end)| *match_start < span_end && *match_end > span_start)
 }

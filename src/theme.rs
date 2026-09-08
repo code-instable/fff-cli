@@ -27,9 +27,21 @@ pub const TRUNCATED_STYLE: Style = Style::new().fg(COMMENT).add_modifier(Modifie
 pub const MATCH_LINE_BG: Color = Color::Rgb(0x20, 0x22, 0x30);
 pub const MATCH_HIGHLIGHT_BG: Color = Color::Rgb(0x55, 0x50, 0x20);
 pub const MATCH_HIGHLIGHT_FG: Color = Color::Rgb(0xFF, 0xEA, 0x9B);
+pub const EXACT_MATCH_HIGHLIGHT_BG: Color = Color::Rgb(0x1F, 0x5E, 0x3A);
+pub const EXACT_MATCH_HIGHLIGHT_FG: Color = Color::Rgb(0xB3, 0xFF, 0xC7);
 
+/// Style for a fuzzy (scattered-character) match: matched characters exist
+/// in the line but are not contiguous.
 pub fn match_span_style(base: Style) -> Style {
     base.bg(MATCH_HIGHLIGHT_BG).fg(MATCH_HIGHLIGHT_FG)
+}
+
+/// Style for an exact match: the matched characters form one contiguous
+/// substring of the line, so it is called out more strongly than a fuzzy hit.
+pub fn exact_match_span_style(base: Style) -> Style {
+    base.bg(EXACT_MATCH_HIGHLIGHT_BG)
+        .fg(EXACT_MATCH_HIGHLIGHT_FG)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub const BUTTON_ACTIVE_BG: Color = Color::Rgb(0x40, 0x45, 0x60);
