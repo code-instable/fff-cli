@@ -16,5 +16,5 @@ crossterm = "0.28"
 dirs = "5.0"
 fff-search = "=0.9.6"
 ratatui = "0.29"
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "regex-onig"] }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "parsing", "regex-onig", "yaml-load"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }

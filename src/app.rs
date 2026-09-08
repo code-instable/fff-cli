@@ -5,7 +5,6 @@ use anyhow::Result;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxSet;
-use two_face::syntax::extra_newlines;
 
 use crate::engine::{ContentMatch, FileGroup, SearchEngine, SearchItem};
 use crate::preview::{self, PreviewMatch};
@@ -56,7 +55,7 @@ impl App {
             preview_lines: Vec::new(),
             preview_scroll: 0,
             preview_area_height: 20,
-            syntax_set: extra_newlines(),
+            syntax_set: preview::build_syntax_set(),
             limit: limit.max(1),
             mode,
             file_groups: Vec::new(),

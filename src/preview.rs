@@ -3,12 +3,26 @@ use std::io::Read;
 use std::path::Path;
 
 use ratatui::text::{Line, Span};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxSet};
 
+use crate::kdl_syntax::KDL_SYNTAX_YAML;
 use crate::theme;
 
 const MAX_BYTES: u64 = 128 * 1024;
 const MAX_LINES: usize = 250;
+
+/// The base syntax set extended with languages `two-face` doesn't bundle
+/// (currently just KDL). Falls back to the unmodified set if the hand-written
+/// KDL definition somehow fails to parse, rather than losing every other
+/// language over one bad grammar.
+pub fn build_syntax_set() -> SyntaxSet {
+    let mut builder = two_face::syntax::extra_newlines().into_builder();
+    match SyntaxDefinition::load_from_str(KDL_SYNTAX_YAML, true, None) {
+        Ok(kdl) => builder.add(kdl),
+        Err(error) => eprintln!("warning: could not load built-in KDL syntax: {error}"),
+    }
+    builder.build()
+}
 
 #[derive(Clone, Debug)]
 pub struct PreviewMatch {
@@ -213,7 +227,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::load_base;
+    use super::{build_syntax_set, load_base};
 
     #[test]
     fn text_preview_has_line_numbers() {
@@ -239,6 +253,87 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.content.contains("2 │")));
+    }
+
+    #[test]
+    fn kdl_syntax_is_registered() {
+        let syntax_set = build_syntax_set();
+        let syntax = syntax_set
+            .find_syntax_by_extension("kdl")
+            .expect("KDL syntax should be available");
+        assert_eq!(syntax.name, "KDL");
+    }
+
+    #[test]
+    fn kdl_file_is_tokenized_not_treated_as_plain_text() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}.kdl",
+            std::process::id()
+        ));
+        fs::write(&path, "node_name \"arg\" prop=1 {\n  child 1 2 3\n}\n").unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 3);
+        // A plain-text fallback would render the whole line as one span
+        // (after the line-number span); real KDL tokenization splits the
+        // node name, string argument, and property into separate spans.
+        assert!(
+            preview.lines[0].spans.len() > 3,
+            "expected the KDL line to be split into multiple styled spans, got {:?}",
+            preview.lines[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn kdl_handles_comments_raw_strings_and_slashdash_without_panicking() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}-rich.kdl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "// top level comment\n",
+                "title \"My App\" version=1.5\n",
+                "/* block\n",
+                "   comment */\n",
+                "plugins {\n",
+                "    plugin (path)\"./foo.so\" enabled=true\n",
+                "    plugin2 r#\"C:\\raw\\path\"# retries=3 ratio=0x1F\n",
+                "    /-disabled_node \"ignored\"\n",
+                "    keybinds {\n",
+                "        bind \"ctrl+c\" { quit; }\n",
+                "        bind2 val=#null flag=#false\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 13);
+        let total_spans: usize = preview.lines.iter().map(|line| line.spans.len()).sum();
+        assert!(
+            total_spans > preview.lines.len() * 2,
+            "expected varied tokenization across the file, got {total_spans} spans across {} lines",
+            preview.lines.len()
+        );
     }
 
     #[test]
