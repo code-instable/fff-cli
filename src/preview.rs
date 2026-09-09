@@ -266,6 +266,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{build_syntax_set, load_base};
+    use crate::theme;
 
     #[test]
     fn text_preview_has_line_numbers() {
@@ -409,11 +410,37 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(preview.lines.len(), 5);
-        let total_spans: usize = preview.lines.iter().map(|line| line.spans.len()).sum();
+
+        // A recipe with a default parameter value (`target="release"`) must
+        // still be recognized as a recipe header: the `=` in the default
+        // used to break the header-detection lookahead, leaving the whole
+        // line (and its body) unclassified plain text.
+        let header_line = &preview.lines[3];
+        let build_span = header_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "build")
+            .expect("recipe name 'build' should be its own styled span");
+        assert_ne!(
+            build_span.style,
+            theme::DEFAULT_STYLE,
+            "recipe name should be highlighted, not rendered as plain text"
+        );
+
+        // `{{ ... }}` interpolation inside a quoted recipe-body string
+        // (the common `echo "hello {{name}}"` idiom) should be tokenized as
+        // its own punctuation, not swallowed as literal string text - which
+        // only happens once the recipe header above was actually recognized
+        // and the body's string context knows about interpolation.
+        let body_line = &preview.lines[4];
         assert!(
-            total_spans > preview.lines.len() * 2,
-            "expected the justfile to be tokenized, not treated as plain text, got {total_spans} spans across {} lines",
-            preview.lines.len()
+            body_line.spans.iter().any(|s| s.content.as_ref() == "{{"),
+            "expected {{{{ to be tokenized as interpolation punctuation, got {:?}",
+            body_line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -26,7 +26,7 @@ contexts:
       scope: variable.other.just
     - match: ':='
       scope: keyword.operator.assignment.just
-    - match: '^(@?[A-Za-z_][A-Za-z0-9_-]*)(?=[^:=\n]*:(?!=))'
+    - match: '^(@?[A-Za-z_][A-Za-z0-9_-]*)(?=[^:\n]*:(?!=))'
       scope: entity.name.function.just
       push: recipe_header
     - include: strings
@@ -84,7 +84,7 @@ contexts:
     - match: '\{\{'
       scope: punctuation.section.interpolation.begin.just
       push: interpolation
-    - include: strings
+    - include: body_strings
 
   interpolation:
     - match: '\}\}'
@@ -121,6 +121,52 @@ contexts:
 
   backtick_string:
     - meta_scope: string.interpolated.backtick.just
+    - match: '`'
+      scope: punctuation.definition.string.end.just
+      pop: true
+
+  # Same three string forms as above, but recognizing `{{ interpolation }}`
+  # inside the string. Used only within recipe bodies, where interpolation
+  # is meaningful (e.g. `echo "hello {{name}}"`) - a plain `strings` include
+  # elsewhere would treat `{{`/`}}` in e.g. a variable's default value as
+  # literal text, which is correct there since interpolation isn't valid
+  # outside a recipe body.
+  body_strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.just
+      push: dq_body_string
+    - match: "'"
+      scope: punctuation.definition.string.begin.just
+      push: sq_body_string
+    - match: '`'
+      scope: punctuation.definition.string.begin.just
+      push: backtick_body_string
+
+  dq_body_string:
+    - meta_scope: string.quoted.double.just
+    - match: '\\.'
+      scope: constant.character.escape.just
+    - match: '\{\{'
+      scope: punctuation.section.interpolation.begin.just
+      push: interpolation
+    - match: '"'
+      scope: punctuation.definition.string.end.just
+      pop: true
+
+  sq_body_string:
+    - meta_scope: string.quoted.single.just
+    - match: '\{\{'
+      scope: punctuation.section.interpolation.begin.just
+      push: interpolation
+    - match: "'"
+      scope: punctuation.definition.string.end.just
+      pop: true
+
+  backtick_body_string:
+    - meta_scope: string.interpolated.backtick.just
+    - match: '\{\{'
+      scope: punctuation.section.interpolation.begin.just
+      push: interpolation
     - match: '`'
       scope: punctuation.definition.string.end.just
       pop: true
