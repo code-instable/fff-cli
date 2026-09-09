@@ -32,6 +32,7 @@ pub struct ContentMatch {
     pub col: usize,
     pub line_content: String,
     pub match_byte_offsets: Vec<(usize, usize)>,
+    pub fuzzy_score: Option<u16>,
 }
 
 impl ContentMatch {
@@ -209,6 +210,7 @@ impl SearchEngine {
                             .iter()
                             .map(|(s, e)| (*s as usize, *e as usize))
                             .collect(),
+                        fuzzy_score: m.fuzzy_score,
                     });
                 }
             }
@@ -222,11 +224,16 @@ impl SearchEngine {
             });
         }
 
+        // Rank files by their best match first (a strong single hit surfaces
+        // above a file full of weak, scattered ones), then by match count and
+        // path as tiebreakers.
         file_groups.sort_by(|a, b| {
-            b.matches
-                .len()
-                .cmp(&a.matches.len())
-                .then(a.relative.cmp(&b.relative))
+            let score_a = top_score(a);
+            let score_b = top_score(b);
+            score_b
+                .cmp(&score_a)
+                .then_with(|| b.matches.len().cmp(&a.matches.len()))
+                .then_with(|| a.relative.cmp(&b.relative))
         });
 
         Ok(ContentSearchSnapshot {
@@ -268,6 +275,15 @@ impl SearchEngine {
 
         warnings
     }
+}
+
+fn top_score(group: &FileGroup) -> u16 {
+    group
+        .matches
+        .iter()
+        .filter_map(|m| m.fuzzy_score)
+        .max()
+        .unwrap_or(0)
 }
 
 fn initialise_persistent_state(

@@ -1,5 +1,8 @@
 mod app;
 mod engine;
+mod just_syntax;
+mod kdl_syntax;
+mod mojo_syntax;
 mod preview;
 mod theme;
 mod ui;

@@ -3,12 +3,67 @@ use std::io::Read;
 use std::path::Path;
 
 use ratatui::text::{Line, Span};
-use syntect::parsing::{ParseState, ScopeStack, SyntaxSet};
+use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet};
 
+use crate::just_syntax::JUST_SYNTAX_YAML;
+use crate::kdl_syntax::KDL_SYNTAX_YAML;
+use crate::mojo_syntax::MOJO_SYNTAX_YAML;
 use crate::theme;
 
 const MAX_BYTES: u64 = 128 * 1024;
 const MAX_LINES: usize = 250;
+
+/// Extensions that don't have (and aren't worth writing) a dedicated grammar,
+/// but are a specific other language's syntax in disguise: `.sbatch` files
+/// are SLURM batch scripts, i.e. bash with `#SBATCH` pragma comments.
+const EXTENSION_ALIASES: &[(&str, &str)] = &[("sbatch", "sh")];
+
+/// The base syntax set extended with languages `two-face` doesn't bundle
+/// (currently KDL, justfiles, and Mojo). Falls back to the unmodified set if
+/// a hand-written definition somehow fails to parse, rather than losing
+/// every other language over one bad grammar.
+///
+/// Uses the `no_newlines` variant because `load_base` feeds `parse_line`
+/// each line with its terminator already stripped (via `str::lines`). Some
+/// grammars (e.g. bash's shebang/comment handling) rely on matching the
+/// literal `\n` to pop out of a line-scoped context; paired with the
+/// `newlines` variant, that pop never fires and the context leaks into every
+/// subsequent line, silently swallowing the rest of the file as one comment.
+pub fn build_syntax_set() -> SyntaxSet {
+    let mut builder = two_face::syntax::extra_no_newlines().into_builder();
+    let languages = [
+        ("KDL", KDL_SYNTAX_YAML),
+        ("Just", JUST_SYNTAX_YAML),
+        ("Mojo", MOJO_SYNTAX_YAML),
+    ];
+    for (name, yaml) in languages {
+        match SyntaxDefinition::load_from_str(yaml, false, None) {
+            Ok(syntax) => builder.add(syntax),
+            Err(error) => eprintln!("warning: could not load built-in {name} syntax: {error}"),
+        }
+    }
+    builder.build()
+}
+
+/// Resolves the syntax for a file, trying (in order): the full file name
+/// (so extensionless files like `justfile` or `Makefile` match by name),
+/// the extension, an extension alias (e.g. `.sbatch` -> `.sh`), and finally
+/// plain text.
+fn resolve_syntax<'a>(syntax_set: &'a SyntaxSet, path: &Path) -> &'a SyntaxReference {
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    syntax_set
+        .find_syntax_by_extension(file_name)
+        .or_else(|| syntax_set.find_syntax_by_extension(ext))
+        .or_else(|| {
+            EXTENSION_ALIASES
+                .iter()
+                .find(|(from, _)| from.eq_ignore_ascii_case(ext))
+                .and_then(|(_, to)| syntax_set.find_syntax_by_extension(to))
+        })
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text())
+}
 
 #[derive(Clone, Debug)]
 pub struct PreviewMatch {
@@ -84,10 +139,7 @@ pub fn load_base(syntax_set: &SyntaxSet, path: &Path) -> PreviewResult {
     let content = String::from_utf8_lossy(&bytes);
     let raw_lines: Vec<&str> = content.lines().take(MAX_LINES).collect();
 
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let syntax = syntax_set
-        .find_syntax_by_extension(ext)
-        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let syntax = resolve_syntax(syntax_set, path);
 
     let mut parse_state = ParseState::new(syntax);
     let mut scope_stack = ScopeStack::new();
@@ -141,12 +193,39 @@ pub fn load_base(syntax_set: &SyntaxSet, path: &Path) -> PreviewResult {
     PreviewResult { lines: result }
 }
 
-pub fn apply_match_highlight(lines: &mut [Line<'static>], target: &PreviewMatch) {
+/// A match whose characters form a single contiguous span reads as a real
+/// literal substring hit; one broken into several ranges was pieced together
+/// by the fuzzy matcher from scattered characters. The two are highlighted
+/// differently so a glance at the preview shows which matches are "real".
+fn is_exact_match(target: &PreviewMatch) -> bool {
+    target.match_byte_offsets.len() == 1
+}
+
+/// Highlights every match in `matches` within the preview. `current_line`,
+/// when set, marks the match the user has focused (e.g. via up/down through
+/// an expanded file's matches) so it can be called out from the rest.
+pub fn apply_match_highlight(
+    lines: &mut [Line<'static>],
+    matches: &[PreviewMatch],
+    current_line: Option<u64>,
+) {
+    for target in matches {
+        let is_current = current_line == Some(target.line_number);
+        apply_single_match_highlight(lines, target, is_current);
+    }
+}
+
+fn apply_single_match_highlight(
+    lines: &mut [Line<'static>],
+    target: &PreviewMatch,
+    is_current: bool,
+) {
     let target_idx = (target.line_number as usize).saturating_sub(1);
     if target_idx >= lines.len() {
         return;
     }
 
+    let exact = is_exact_match(target);
     let line = &mut lines[target_idx];
 
     if let Some(span) = line.spans.first_mut() {
@@ -158,8 +237,15 @@ pub fn apply_match_highlight(lines: &mut [Line<'static>], target: &PreviewMatch)
         let span_end = pos + span.content.len();
 
         let mut style = span.style.bg(theme::MATCH_LINE_BG);
-        if span_overlaps_match(pos, span_end, Some(target)) {
-            style = theme::match_span_style(style);
+        if span_overlaps_match(pos, span_end, target) {
+            style = if exact {
+                theme::exact_match_span_style(style)
+            } else {
+                theme::match_span_style(style)
+            };
+            if is_current {
+                style = style.add_modifier(ratatui::style::Modifier::UNDERLINED);
+            }
         }
         span.style = style;
 
@@ -167,11 +253,9 @@ pub fn apply_match_highlight(lines: &mut [Line<'static>], target: &PreviewMatch)
     }
 }
 
-fn span_overlaps_match(span_start: usize, span_end: usize, target: Option<&PreviewMatch>) -> bool {
-    let Some(t) = target else {
-        return false;
-    };
-    t.match_byte_offsets
+fn span_overlaps_match(span_start: usize, span_end: usize, target: &PreviewMatch) -> bool {
+    target
+        .match_byte_offsets
         .iter()
         .any(|(match_start, match_end)| *match_start < span_end && *match_end > span_start)
 }
@@ -181,7 +265,8 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::load_base;
+    use super::{build_syntax_set, load_base};
+    use crate::theme;
 
     #[test]
     fn text_preview_has_line_numbers() {
@@ -194,7 +279,7 @@ mod tests {
             std::process::id()
         ));
         fs::write(&path, "alpha\nbeta\n").unwrap();
-        let syntax_set = two_face::syntax::extra_newlines();
+        let syntax_set = two_face::syntax::extra_no_newlines();
         let preview = load_base(&syntax_set, &path);
         let _ = fs::remove_file(path);
 
@@ -210,8 +295,234 @@ mod tests {
     }
 
     #[test]
+    fn kdl_syntax_is_registered() {
+        let syntax_set = build_syntax_set();
+        let syntax = syntax_set
+            .find_syntax_by_extension("kdl")
+            .expect("KDL syntax should be available");
+        assert_eq!(syntax.name, "KDL");
+    }
+
+    #[test]
+    fn kdl_file_is_tokenized_not_treated_as_plain_text() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}.kdl",
+            std::process::id()
+        ));
+        fs::write(&path, "node_name \"arg\" prop=1 {\n  child 1 2 3\n}\n").unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 3);
+        // A plain-text fallback would render the whole line as one span
+        // (after the line-number span); real KDL tokenization splits the
+        // node name, string argument, and property into separate spans.
+        assert!(
+            preview.lines[0].spans.len() > 3,
+            "expected the KDL line to be split into multiple styled spans, got {:?}",
+            preview.lines[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn kdl_handles_comments_raw_strings_and_slashdash_without_panicking() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}-rich.kdl",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "// top level comment\n",
+                "title \"My App\" version=1.5\n",
+                "/* block\n",
+                "   comment */\n",
+                "plugins {\n",
+                "    plugin (path)\"./foo.so\" enabled=true\n",
+                "    plugin2 r#\"C:\\raw\\path\"# retries=3 ratio=0x1F\n",
+                "    /-disabled_node \"ignored\"\n",
+                "    keybinds {\n",
+                "        bind \"ctrl+c\" { quit; }\n",
+                "        bind2 val=#null flag=#false\n",
+                "    }\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 13);
+        let total_spans: usize = preview.lines.iter().map(|line| line.spans.len()).sum();
+        assert!(
+            total_spans > preview.lines.len() * 2,
+            "expected varied tokenization across the file, got {total_spans} spans across {} lines",
+            preview.lines.len()
+        );
+    }
+
+    #[test]
+    fn just_syntax_is_registered() {
+        let syntax_set = build_syntax_set();
+        let syntax = syntax_set
+            .find_syntax_by_extension("justfile")
+            .expect("Just syntax should be available");
+        assert_eq!(syntax.name, "Just");
+    }
+
+    #[test]
+    fn justfile_resolves_by_filename_without_extension() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("fff-cli-preview-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("justfile");
+        fs::write(
+            &path,
+            concat!(
+                "# say hello\n",
+                "default: build\n",
+                "\n",
+                "build target=\"release\":\n",
+                "    echo \"building {{target}}\"\n",
+            ),
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(preview.lines.len(), 5);
+
+        // A recipe with a default parameter value (`target="release"`) must
+        // still be recognized as a recipe header: the `=` in the default
+        // used to break the header-detection lookahead, leaving the whole
+        // line (and its body) unclassified plain text.
+        let header_line = &preview.lines[3];
+        let build_span = header_line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "build")
+            .expect("recipe name 'build' should be its own styled span");
+        assert_ne!(
+            build_span.style,
+            theme::DEFAULT_STYLE,
+            "recipe name should be highlighted, not rendered as plain text"
+        );
+
+        // `{{ ... }}` interpolation inside a quoted recipe-body string
+        // (the common `echo "hello {{name}}"` idiom) should be tokenized as
+        // its own punctuation, not swallowed as literal string text - which
+        // only happens once the recipe header above was actually recognized
+        // and the body's string context knows about interpolation.
+        let body_line = &preview.lines[4];
+        assert!(
+            body_line.spans.iter().any(|s| s.content.as_ref() == "{{"),
+            "expected {{{{ to be tokenized as interpolation punctuation, got {:?}",
+            body_line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sbatch_extension_is_highlighted_as_bash() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}.sbatch",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "#!/bin/bash\n#SBATCH --job-name=test\necho \"hello\"\n",
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 3);
+        // A plain-text fallback would render each line as a single span
+        // after the line-number span; bash tokenization splits it further
+        // (e.g. the shebang, the string in the echo command).
+        assert!(
+            preview.lines[2].spans.len() > 2,
+            "expected the echo line to be tokenized as bash, got {:?}",
+            preview.lines[2]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mojo_syntax_is_registered() {
+        let syntax_set = build_syntax_set();
+        let syntax = syntax_set
+            .find_syntax_by_extension("mojo")
+            .expect("Mojo syntax should be available");
+        assert_eq!(syntax.name, "Mojo");
+    }
+
+    #[test]
+    fn mojo_file_is_tokenized_not_treated_as_plain_text() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fff-cli-preview-{}-{nonce}.mojo",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            concat!(
+                "# greet someone\n",
+                "fn greet(name: String) raises -> String:\n",
+                "    var count: Int = 0\n",
+                "    return f\"hello {name}, count={count}\"\n",
+            ),
+        )
+        .unwrap();
+        let syntax_set = build_syntax_set();
+        let preview = load_base(&syntax_set, &path);
+        let _ = fs::remove_file(path);
+
+        assert_eq!(preview.lines.len(), 4);
+        let total_spans: usize = preview.lines.iter().map(|line| line.spans.len()).sum();
+        assert!(
+            total_spans > preview.lines.len() * 2,
+            "expected the Mojo file to be tokenized, not treated as plain text, got {total_spans} spans across {} lines",
+            preview.lines.len()
+        );
+    }
+
+    #[test]
     fn extended_syntaxes_available() {
-        let syntax_set = two_face::syntax::extra_newlines();
+        let syntax_set = two_face::syntax::extra_no_newlines();
         
         // Debug: print all syntaxes to see what's available
         eprintln!("\nTotal syntaxes: {}", syntax_set.syntaxes().len());

@@ -5,7 +5,6 @@ use anyhow::Result;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
 use syntect::parsing::SyntaxSet;
-use two_face::syntax::extra_newlines;
 
 use crate::engine::{ContentMatch, FileGroup, SearchEngine, SearchItem};
 use crate::preview::{self, PreviewMatch};
@@ -56,7 +55,7 @@ impl App {
             preview_lines: Vec::new(),
             preview_scroll: 0,
             preview_area_height: 20,
-            syntax_set: extra_newlines(),
+            syntax_set: preview::build_syntax_set(),
             limit: limit.max(1),
             mode,
             file_groups: Vec::new(),
@@ -315,20 +314,38 @@ impl App {
         }
     }
 
-    fn current_match_info(&self) -> Option<PreviewMatch> {
-        match self.mode {
+    /// All matches belonging to the file currently shown in the preview:
+    /// the expanded file's matches while stepping through them, or the
+    /// selected file group's matches while still choosing which file to open.
+    fn current_preview_matches(&self) -> Vec<PreviewMatch> {
+        let group = match self.mode {
             SearchMode::Content => match self.expanded_file_index {
-                Some(file_idx) => self
-                    .list_state
-                    .selected()
-                    .and_then(|idx| self.file_groups[file_idx].matches.get(idx))
+                Some(file_idx) => self.file_groups.get(file_idx),
+                None => self.selected_file_group(),
+            },
+            SearchMode::File => None,
+        };
+
+        group
+            .map(|group| {
+                group
+                    .matches
+                    .iter()
                     .map(|m| PreviewMatch {
                         line_number: m.line_number,
                         match_byte_offsets: m.match_byte_offsets.clone(),
-                    }),
-                None => None,
-            },
-            _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The line currently focused within an expanded file's matches, if any.
+    fn current_selected_line(&self) -> Option<u64> {
+        if self.expanded_file_index.is_some() {
+            self.selected_content_match().map(|m| m.line_number)
+        } else {
+            None
         }
     }
 
@@ -360,15 +377,17 @@ impl App {
     }
 
     fn apply_preview_highlight(&mut self) {
-        let match_info = self.current_match_info();
+        let matches = self.current_preview_matches();
+        let current_line = self.current_selected_line();
 
         let mut lines = self.cached_base_lines.clone();
-        if let Some(match_info) = match_info {
-            preview::apply_match_highlight(&mut lines, &match_info);
+        if !matches.is_empty() {
+            preview::apply_match_highlight(&mut lines, &matches, current_line);
 
+            let focus_line = current_line.unwrap_or(matches[0].line_number);
             let visible_height = self.preview_area_height.saturating_sub(2) as u64;
             let center_offset = visible_height / 2;
-            let target_scroll = match_info.line_number.saturating_sub(center_offset);
+            let target_scroll = focus_line.saturating_sub(center_offset);
             let max_scroll = lines.len().saturating_sub(visible_height as usize);
             self.preview_scroll = target_scroll.min(max_scroll as u64) as u16;
         } else {
